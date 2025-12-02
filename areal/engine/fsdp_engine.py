@@ -315,7 +315,6 @@ class FSDPEngine(TrainEngine):
                 tokenizer.save_pretrained(path)
             if processor is not None:
                 processor.save_pretrained(path)
-
         dist.barrier(group=self.cpu_group)
 
     def _load_model_from_hf(self, path: str):
@@ -1161,7 +1160,7 @@ class FSDPEngine(TrainEngine):
             model_kwargs = {}
 
         common_kwargs = {
-            "dtype": dtype,
+            "torch_dtype": dtype,
             "attn_implementation": self.config.attn_impl,
         }
         model_kwargs.update(common_kwargs)

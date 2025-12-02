@@ -16,7 +16,7 @@ from areal.api.engine_api import InferenceEngine
 from areal.api.io_struct import ModelRequest, ModelResponse, ParamSpec, WeightUpdateMeta
 from areal.api.scheduler_api import Job, Scheduler, Worker
 from areal.api.workflow_api import RolloutWorkflow
-from areal.controller.batch import DistributedBatchMemory
+from areal.controller.batch import DistributedBatch, DistributedBatchMemory
 from areal.core.staleness_manager import StalenessManager
 from areal.core.workflow_executor import BatchTaskDispatcher
 from areal.utils import logging, perf_tracer
@@ -376,7 +376,7 @@ class RolloutController:
         workflow: RolloutWorkflow | type[RolloutWorkflow] | str,
         workflow_kwargs: dict[str, Any] | None = None,
         should_accept_fn: str | None = None,
-    ) -> dict[str, Any]:
+    ) -> DistributedBatch:
         perf_tracer.instant(
             "rollout_controller.rollout_batch",
             category="scheduler",

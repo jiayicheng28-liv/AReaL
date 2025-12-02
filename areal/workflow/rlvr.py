@@ -52,7 +52,7 @@ class RLVRWorkflow(RolloutWorkflow):
         self,
         reward_fn: Callable[..., Any] | str,
         gconfig: GenerationHyperparameters,
-        tokenizer: PreTrainedTokenizerFast,
+        tokenizer: PreTrainedTokenizerFast | str,
         enable_thinking: bool = False,
         rollout_stat_scope: str = "rollout",
         dump_dir: str | None = None,
@@ -64,7 +64,7 @@ class RLVRWorkflow(RolloutWorkflow):
         ] = default_data_extract_prompt_fn,
     ):
         self.reward_fn = reward_fn
-        self.gconfig = gconfig.new_with_stop_and_pad_token_ids(tokenizer)
+        self.gconfig = gconfig
         self.tokenizer = tokenizer
         self.enable_thinking = enable_thinking
         self.dump_dir = dump_dir
@@ -137,6 +137,16 @@ class RLVRWorkflow(RolloutWorkflow):
     async def arun_episode(
         self, engine: InferenceEngine, data: dict[str, Any]
     ) -> dict[str, torch.Tensor]:
+        if isinstance(self.tokenizer, str):
+            from areal.utils.hf_utils import load_hf_tokenizer
+
+            tokenizer = load_hf_tokenizer(self.tokenizer)
+            if tokenizer.pad_token_id not in self.gconfig.stop_token_ids:
+                self.gconfig.stop_token_ids.append(tokenizer.pad_token_id)
+            if tokenizer.eos_token_id not in self.gconfig.stop_token_ids:
+                self.gconfig.stop_token_ids.append(tokenizer.eos_token_id)
+            self.tokenizer = tokenizer
+
         # NOTE: load reward function dynamically if given as string
         if isinstance(self.reward_fn, str):
             self.reward_fn = import_from_string(self.reward_fn)
