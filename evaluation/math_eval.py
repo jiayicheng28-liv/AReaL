@@ -145,11 +145,20 @@ def generate_in_parallel(requests, model_args, sampling_params, data_parallel_si
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(
             [str(x) for x in cuda_visisble_devices]
         )
-        # print("OS.ENVIRON", json.dumps({x: os.environ[x]  for x in sorted(dict(os.environ))}))
+
+        # 🔧 Completely disable TorchInductor / torch.compile inside this worker
+        os.environ["TORCHINDUCTOR_DISABLE"] = "1"
+        os.environ["TORCHDYNAMO_DISABLE"] = "1"
+
+        # 🔧 Force vLLM to run in eager mode (no compile / Triton path)
+        model_args = {
+            **model_args,
+            "enforce_eager": True,
+        }
+
         llm = LLM(**model_args)
         return llm.generate(requests, sampling_params=sampling_params)
 
-    # print("OUT_OS_ENVIRON", json.dumps({x: os.environ[x]  for x in sorted(dict(os.environ))}))
     all_cuda_visisble_devices = os.environ["CUDA_VISIBLE_DEVICES"].split(",")
     requests = [list(x) for x in distribute(data_parallel_size, requests)]
     inputs = (
@@ -163,9 +172,6 @@ def generate_in_parallel(requests, model_args, sampling_params, data_parallel_si
     ray.shutdown()
     return undistribute(results)
 
-
-# from more_itertools import distribute
-from itertools import islice, tee
 
 
 def distribute(n, iterable):
