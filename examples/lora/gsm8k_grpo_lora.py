@@ -1,3 +1,36 @@
+"""
+This script demonstrates how to train a model using PPO/GRPO with LoRA (Low-Rank Adaptation) in AReaL.
+
+LoRA Implementation Details in AReaL:
+
+1.  **Actor Initialization (FSDPPPOActor)**:
+    -   The `FSDPPPOActor` (inheriting from `FSDPEngine`) initializes the base model.
+    -   It checks `config.actor.use_lora` (mapped from `TrainEngineConfig`).
+    -   If enabled, it wraps the base model using the `peft` library's `get_peft_model`.
+    -   This is handled in `areal/engine/fsdp_engine.py` -> `_apply_peft_wrapper`.
+    -   Only LoRA parameters are trainable; base model weights are frozen.
+
+2.  **Inference Engine (RemoteSGLangEngine)**:
+    -   The inference engine is configured to support LoRA via `SGLangConfig`.
+    -   It handles dynamic loading/unloading of LoRA adapters during the training loop.
+    -   Implementation: `areal/engine/sglang_remote.py` -> `build_disk_weight_update_requests` and `build_generation_request`.
+
+3.  **Weight Updates**:
+    -   `WeightUpdateMeta` tracks the location of saved checkpoints.
+    -   When `actor.update_weights` is called, the actor saves the LoRA adapter weights to disk.
+    -   The `RemoteSGLangEngine` then receives a signal to load the new adapter from that path.
+    -   This avoids reloading the entire base model, significantly speeding up the weight sync process.
+
+4.  **Configuration**:
+    -   LoRA parameters (rank, alpha, target modules) are defined in `examples/lora/gsm8k_grpo_lora.yaml`.
+    -   These map to `TrainEngineConfig` in `areal/api/cli_args.py`.
+
+Key Files:
+-   `areal/engine/fsdp_engine.py`: LoRA wrapping logic (`_apply_peft_wrapper`).
+-   `areal/engine/sglang_remote.py`: Remote inference with LoRA support.
+-   `areal/api/cli_args.py`: Configuration definitions.
+"""
+
 import os
 import sys
 from copy import deepcopy
@@ -62,6 +95,8 @@ def main(args):
         raise ValueError("LoRA does not support parallelism other than FSDP.")
 
     # Initialize train engine
+    # FSDPPPOActor will apply LoRA wrapper if config.actor.use_lora is True.
+    # See areal/engine/fsdp_engine.py -> _apply_peft_wrapper
     actor = FSDPPPOActor(config=config.actor)
     actor.create_process_group(parallel_strategy=parallel_strategy)
 
@@ -93,6 +128,8 @@ def main(args):
     )
 
     # Initialize inference engine
+    # RemoteSGLangEngine handles LoRA adapter loading/unloading for inference.
+    # See areal/engine/sglang_remote.py
     rollout = RemoteSGLangEngine(config.rollout)
     rollout.initialize(train_data_parallel_size=1)
     eval_rollout = RemoteSGLangEngine(deepcopy(config.rollout))
@@ -104,9 +141,11 @@ def main(args):
         config.saver.experiment_name,
         config.saver.trial_name,
         config.saver.fileroot,
-        use_lora=True,
+        use_lora=True,  # Explicitly enable LoRA mode for weight updates
     )
 
+    # Connect actor and rollout engine.
+    # The actor will signal the rollout engine when new LoRA weights are available.
     actor.initialize(None, ft_spec)
     actor.connect_engine(rollout, weight_update_meta)
 
@@ -217,6 +256,9 @@ def main(args):
         rollout.pause()
 
         with stats_tracker.record_timing("update_weights"):
+            # Save the updated LoRA adapter weights to disk and notify inference engine.
+            # In LoRA mode, this saves only the adapter, not the full model.
+            # See areal/engine/fsdp_engine.py -> save (calls save_pretrained for PEFT)
             actor.update_weights(weight_update_meta)
 
             actor.set_version(global_step + 1)

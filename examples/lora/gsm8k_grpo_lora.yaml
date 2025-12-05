@@ -72,11 +72,13 @@ actor:
     mean_level: batch
     std_level: batch
   max_new_tokens: ${gconfig.max_new_tokens}
-  # lora
+  # lora configuration
+  # These fields map to areal.api.cli_args.TrainEngineConfig
   use_lora: true
   peft_type: lora
   lora_rank: 32
   lora_alpha: 16
+  # Modules to apply LoRA to. "all-linear" is a common shortcut.
   target_modules: [all-linear]
 
 ref:
@@ -99,7 +101,9 @@ sglang:
   max_running_requests: null
   context_length: 32768
   mem_fraction_static: 0.8
-  # lora
+  # lora support for inference
+  # Maps to areal.api.cli_args.SGLangConfig
+  # Must match actor's LoRA settings to ensure compatibility
   enable_lora: ${actor.use_lora}
   max_lora_rank: ${actor.lora_rank}
   lora_target_modules: ${actor.target_modules}
