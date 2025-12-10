@@ -27,14 +27,38 @@ from areal.utils.recover import RecoverHandler
 from areal.utils.saver import Saver
 from areal.utils.stats_logger import StatsLogger
 from areal.workflow.rlvr import RLVRWorkflow
+#LORA data paralellism:
+""""
+On every rank:
 
+A frozen base model (same weights, never updated)
+
+A set of LoRA adapter weights (the only trainable parameters)
+
+An FSDP wrapper around the trainable module(s) so we can shard params/grad/optimizer state
+
+A different slice of data (different trajectories / samples for PPO/GRPO)
+
+Each rank stores only 1/N of that parameter (plus its optimizer state).
+
+When you run a forward pass on a rank:
+
+FSDP all-gathers the shards so this rank temporarily has the full LoRA weights it needs.
+
+During backward:
+
+Gradients are computed on that rank,
+
+Then reduced/sharded back across ranks (so each rank ends up with its own shard of the global gradient).
+"""
 
 def gsm8k_reward_fn(prompt, completions, prompt_ids, completion_ids, answer, **kwargs):
     from areal.reward.math_parser import process_results
 
     return int(process_results(completions, answer)[0])
 
-
+#each branch get broadcast of part of the new rollout from rank0
+#rank0 is data-parallel head
 def bcast_and_split_from_rank0(batch: dict | None, granularity: int) -> dict:
     batch = broadcast_tensor_container(batch, src_rank=0)
     bs = get_batch_size(batch)
@@ -50,18 +74,43 @@ def bcast_and_split_from_rank0(batch: dict | None, granularity: int) -> dict:
 
 def main(args):
     config, _ = load_expr_config(args, GRPOConfig)
-
     rank = int(os.getenv("RANK"))
     tokenizer = load_hf_tokenizer(config.tokenizer_path)
 
     seeding.set_random_seed(config.seed, key=f"trainer{rank}")
     allocation_mode = AllocationMode.from_str(config.allocation_mode)
     parallel_strategy = allocation_mode.train
+    """
+    FSDP strengths (specific to LoRA):
+
+It shards trainable LoRA weights only
+→ huge memory savings
+→ no need to shard frozen weights
+
+It keeps frozen base model on each GPU fully
+→ fast autoregressive rollout
+→ no TP/PP communication bottlenecks
+
+It shards optimizer state and gradients for LoRA only
+→ tiny communication cost
+
+It can all-gather LoRA weights only at layer entry
+→ LoRA modules are tiny, so all-gather is cheap
+
+It works perfectly with data parallel RL
+
+each rank does rollout independently
+
+gradients sync only for LoRA
+
+parameter update stays global
+    """
     assert parallel_strategy is not None
     if parallel_strategy.data_parallel_size != parallel_strategy.world_size:
         raise ValueError("LoRA does not support parallelism other than FSDP.")
 
     # Initialize train engine
+    """each rank create its own actor but fsdp link all actor into one conceptually"""
     actor = FSDPPPOActor(config=config.actor)
     actor.create_process_group(parallel_strategy=parallel_strategy)
 
@@ -94,11 +143,19 @@ def main(args):
 
     # Initialize inference engine
     rollout = RemoteSGLangEngine(config.rollout)
+    """
+    Conceptually, train_data_parallel_size tells the remote rollout client:
+
+“How many independent training data-parallel groups exist that will share this rollout server?”
+    """
     rollout.initialize(train_data_parallel_size=1)
     eval_rollout = RemoteSGLangEngine(deepcopy(config.rollout))
     # NOTE: eval does not have any offpolicyness control
     eval_rollout.config.max_head_offpolicyness = int(1e12)
     eval_rollout.initialize()
+    """✅ Yes: both rollout and eval_rollout talk to the same rollout server job.
+
+✅ Yes: with the launcher setup you described, you have one llm_server process that uses 4 GPUs (can be set during launching)"""
 
     weight_update_meta = WeightUpdateMeta.from_disk(
         config.saver.experiment_name,
@@ -108,8 +165,15 @@ def main(args):
     )
 
     actor.initialize(None, ft_spec)
-    actor.connect_engine(rollout, weight_update_meta)
+    """actor.connect_engine(rollout, weight_update_meta) hooks up:
 
+The training-side FSDP actor with the rollout engine so that when you call:
+
+actor.update_weights(weight_update_meta)
+
+the remote SGLang server knows which LoRA files to reload."""
+    actor.connect_engine(rollout, weight_update_meta)
+    #kl divergence control
     ref = None
     if config.actor.kl_ctl > 0 and config.ref is not None:
         ref = FSDPPPOActor(config=config.ref)
@@ -140,8 +204,9 @@ def main(args):
     # Run training.
     saver = Saver(config.saver, ft_spec)
     stats_logger = StatsLogger(config, ft_spec)
+    #evaluate after a number of steps to log the progress of the training
     evaluator = Evaluator(config.evaluator, ft_spec)
-
+    #the object responsible for resuming training from a checkpoint. not used yet
     recover_handler = RecoverHandler(config.recover, ft_spec)
     recover_info = recover_handler.load(
         actor,
@@ -178,6 +243,24 @@ def main(args):
             # the algorithm performance will drop significantly. This may be
             # due to some concurrency issues. Use a single rank for rollout
             # as a temporary workaround.
+            """
+            Rank 0 → rollout.prepare_batch(...)
+
+Pulls some prompts from train_dataloader.
+
+Sends them plus RLVRWorkflow to the remote SGLang rollout server.
+
+SGLang generates “thinking” + answers, logs, etc.
+
+Server returns a TensorContainer of trajectories.
+
+Rank 0 moves them to GPU.
+
+Broadcast to all ranks
+
+bcast_and_split_from_rank0(...) sends the batch from rank 0 to other ranks.
+
+Each rank gets its slice according to config.actor.group_size."""
             if dist.get_rank() == 0:
                 batch = rollout.prepare_batch(
                     train_dataloader,
